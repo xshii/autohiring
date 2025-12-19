@@ -1,12 +1,16 @@
 """网页自动化命令 - 使用 Selenium + YAML 配置"""
 
 import csv
+import io
 import json
+import platform
 import random
 import re
 import time
+import zipfile
 from pathlib import Path
 from typing import Optional, List, Dict, Any
+from urllib.request import urlopen, Request
 
 import typer
 from rich.console import Console
@@ -20,27 +24,94 @@ _driver = None
 # 收集的数据
 _collected_data = []
 
+# 支持的浏览器类型
+SUPPORTED_BROWSERS = ["chrome", "edge"]
 
-def get_driver(headless: bool = False):
-    """获取 ChromeDriver"""
+
+def _get_config_path() -> Path:
+    """获取配置文件路径"""
+    return Path(__file__).parents[4] / "drivers" / "config.json"
+
+
+def _load_config() -> dict:
+    """加载配置"""
+    config_path = _get_config_path()
+    if config_path.exists():
+        try:
+            return json.loads(config_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {"browser": "chrome"}
+
+
+def _save_config(config: dict):
+    """保存配置"""
+    config_path = _get_config_path()
+    config_path.parent.mkdir(exist_ok=True)
+    config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+
+
+def get_current_browser() -> str:
+    """获取当前配置的浏览器"""
+    return _load_config().get("browser", "chrome")
+
+
+def get_browser_path(browser: str = None) -> Optional[str]:
+    """获取浏览器可执行文件路径"""
+    if browser is None:
+        browser = get_current_browser()
+    config = _load_config()
+    return config.get(f"{browser}_path")
+
+
+def get_driver(headless: bool = False, browser: str = None):
+    """获取 WebDriver（支持 Chrome 和 Edge）"""
     from selenium import webdriver
-    from selenium.webdriver.chrome.options import Options
-    from selenium.webdriver.chrome.service import Service
 
-    options = Options()
-    if headless:
-        options.add_argument("--headless")
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    if browser is None:
+        browser = get_current_browser()
 
-    driver_path = Path(__file__).parents[4] / "drivers" / "chromedriver"
-    if driver_path.exists():
-        service = Service(str(driver_path))
-        return webdriver.Chrome(service=service, options=options)
+    drivers_dir = Path(__file__).parents[4] / "drivers"
+    browser_binary = get_browser_path(browser)
 
-    return webdriver.Chrome(options=options)
+    if browser == "edge":
+        from selenium.webdriver.edge.options import Options
+        from selenium.webdriver.edge.service import Service
+
+        options = Options()
+        if browser_binary:
+            options.binary_location = browser_binary
+        if headless:
+            options.add_argument("--headless")
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+
+        driver_path = drivers_dir / ("msedgedriver.exe" if platform.system() == "Windows" else "msedgedriver")
+        if driver_path.exists():
+            service = Service(str(driver_path))
+            return webdriver.Edge(service=service, options=options)
+        return webdriver.Edge(options=options)
+
+    else:  # chrome
+        from selenium.webdriver.chrome.options import Options
+        from selenium.webdriver.chrome.service import Service
+
+        options = Options()
+        if browser_binary:
+            options.binary_location = browser_binary
+        if headless:
+            options.add_argument("--headless")
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+
+        driver_path = drivers_dir / ("chromedriver.exe" if platform.system() == "Windows" else "chromedriver")
+        if driver_path.exists():
+            service = Service(str(driver_path))
+            return webdriver.Chrome(service=service, options=options)
+        return webdriver.Chrome(options=options)
 
 
 def parse_wait_time(value: str) -> float:
@@ -578,3 +649,336 @@ steps:
     console.print(example_yaml)
     console.print("\n[dim]保存为 config.yaml 后运行: autohiring scraper run config.yaml[/dim]")
     console.print("[dim]CSV 循环: 取消 csv 行注释，运行时会为每行数据执行一遍 steps[/dim]")
+
+
+# ============== WebDriver 管理 ==============
+
+def _get_drivers_dir() -> Path:
+    """获取 drivers 目录"""
+    return Path(__file__).parents[4] / "drivers"
+
+
+def _get_browser_version(browser: str) -> Optional[str]:
+    """获取本地浏览器版本"""
+    import subprocess
+    system = platform.system()
+
+    # 优先使用配置的自定义路径
+    custom_path = get_browser_path(browser)
+    if custom_path:
+        try:
+            cmd = f'"{custom_path}" --version'
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            if result.returncode == 0:
+                match = re.search(r"(\d+\.\d+\.\d+\.\d+)", result.stdout)
+                if match:
+                    return match.group(1)
+        except Exception:
+            pass
+
+    try:
+        if browser == "chrome":
+            if system == "Darwin":  # macOS
+                cmd = '"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --version'
+            elif system == "Windows":
+                cmd = 'reg query "HKEY_CURRENT_USER\\Software\\Google\\Chrome\\BLBeacon" /v version'
+            else:  # Linux
+                for name in ["google-chrome", "google-chrome-stable", "chromium-browser", "chromium"]:
+                    result = subprocess.run(f"{name} --version", shell=True, capture_output=True, text=True)
+                    if result.returncode == 0:
+                        match = re.search(r"(\d+\.\d+\.\d+\.\d+)", result.stdout)
+                        return match.group(1) if match else None
+                return None
+        else:  # edge
+            if system == "Darwin":  # macOS
+                cmd = '"/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge" --version'
+            elif system == "Windows":
+                cmd = 'reg query "HKEY_CURRENT_USER\\Software\\Microsoft\\Edge\\BLBeacon" /v version'
+            else:  # Linux
+                for name in ["microsoft-edge", "microsoft-edge-stable"]:
+                    result = subprocess.run(f"{name} --version", shell=True, capture_output=True, text=True)
+                    if result.returncode == 0:
+                        match = re.search(r"(\d+\.\d+\.\d+\.\d+)", result.stdout)
+                        return match.group(1) if match else None
+                return None
+
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        if result.returncode == 0:
+            match = re.search(r"(\d+\.\d+\.\d+\.\d+)", result.stdout)
+            return match.group(1) if match else None
+    except Exception as e:
+        console.print(f"[red]获取浏览器版本失败: {e}[/red]")
+
+    return None
+
+
+def _get_platform_info() -> tuple:
+    """获取平台信息"""
+    system = platform.system()
+    machine = platform.machine().lower()
+
+    if system == "Darwin":
+        return ("mac-arm64" if machine == "arm64" else "mac-x64", "mac64")
+    elif system == "Windows":
+        is_64 = "64" in machine or machine == "amd64"
+        return ("win64" if is_64 else "win32", "win64" if is_64 else "win32")
+    else:  # Linux
+        return ("linux64", "linux64")
+
+
+def _get_driver_url(browser: str, version: str) -> Optional[tuple]:
+    """获取匹配的 WebDriver 下载链接"""
+    chrome_platform, edge_platform = _get_platform_info()
+    major_version = version.split(".")[0]
+
+    try:
+        if browser == "chrome":
+            # Chrome for Testing API
+            api_url = "https://googlechromelabs.github.io/chrome-for-testing/known-good-versions-with-downloads.json"
+            console.print("[dim]获取 ChromeDriver 版本信息...[/dim]")
+
+            req = Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urlopen(req, timeout=30) as response:
+                data = json.loads(response.read().decode())
+
+            matching = [
+                v for v in data["versions"]
+                if v["version"].startswith(f"{major_version}.")
+                and "chromedriver" in v.get("downloads", {})
+            ]
+
+            if not matching:
+                console.print(f"[red]未找到匹配 Chrome {major_version} 的 ChromeDriver[/red]")
+                return None
+
+            latest = matching[-1]
+            for dl in latest["downloads"]["chromedriver"]:
+                if dl["platform"] == chrome_platform:
+                    return dl["url"], latest["version"]
+
+        else:  # edge
+            # Edge WebDriver API
+            console.print("[dim]获取 EdgeDriver 版本信息...[/dim]")
+
+            # 尝试精确版本
+            system = platform.system()
+            if system == "Darwin":
+                edge_plat = "mac64"
+                if platform.machine().lower() == "arm64":
+                    edge_plat = "mac64_m1"
+            elif system == "Windows":
+                edge_plat = "win64" if "64" in platform.machine().lower() else "win32"
+            else:
+                edge_plat = "linux64"
+
+            # 使用 LATEST_RELEASE API
+            base_url = "https://msedgedriver.azureedge.net"
+            version_url = f"{base_url}/LATEST_RELEASE_{major_version}"
+
+            try:
+                req = Request(version_url, headers={"User-Agent": "Mozilla/5.0"})
+                with urlopen(req, timeout=10) as response:
+                    driver_version = response.read().decode().strip()
+            except Exception:
+                # 使用浏览器版本
+                driver_version = version
+
+            download_url = f"{base_url}/{driver_version}/edgedriver_{edge_plat}.zip"
+            return download_url, driver_version
+
+    except Exception as e:
+        console.print(f"[red]获取 WebDriver 下载链接失败: {e}[/red]")
+
+    return None
+
+
+def _download_driver(browser: str, url: str, version: str, dest_dir: Path, force: bool = False) -> Optional[Path]:
+    """下载并解压 WebDriver"""
+    system = platform.system()
+
+    if browser == "chrome":
+        driver_name = "chromedriver.exe" if system == "Windows" else "chromedriver"
+        display_name = "ChromeDriver"
+    else:
+        driver_name = "msedgedriver.exe" if system == "Windows" else "msedgedriver"
+        display_name = "EdgeDriver"
+
+    dest_path = dest_dir / driver_name
+
+    if dest_path.exists() and not force:
+        console.print(f"[yellow]{display_name} 已存在: {dest_path}[/yellow]")
+        console.print("[dim]使用 --force 或 update 命令强制更新[/dim]")
+        return dest_path
+
+    if dest_path.exists() and force:
+        console.print("[dim]删除旧版本...[/dim]")
+        dest_path.unlink()
+
+    try:
+        console.print(f"[cyan]下载 {display_name} {version}...[/cyan]")
+        req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(req, timeout=120) as response:
+            zip_data = response.read()
+
+        console.print(f"[dim]解压 {display_name}...[/dim]")
+        with zipfile.ZipFile(io.BytesIO(zip_data)) as zf:
+            for name in zf.namelist():
+                if name.endswith(driver_name):
+                    with zf.open(name) as src:
+                        dest_path.write_bytes(src.read())
+                    break
+
+        # 设置可执行权限 (Unix)
+        if system != "Windows":
+            dest_path.chmod(0o755)
+
+        console.print(f"[green]✓ {display_name} 已安装: {dest_path}[/green]")
+        return dest_path
+
+    except Exception as e:
+        console.print(f"[red]下载 {display_name} 失败: {e}[/red]")
+        return None
+
+
+@app.command("switch")
+def switch_browser(
+    browser: str = typer.Argument(..., help="浏览器类型: c/chrome 或 e/edge"),
+):
+    """切换默认浏览器"""
+    # 解析简写
+    browser = browser.lower()
+    if browser in ("c", "chrome"):
+        browser = "chrome"
+    elif browser in ("e", "edge"):
+        browser = "edge"
+    else:
+        console.print(f"[red]不支持的浏览器: {browser}[/red]")
+        console.print("[dim]支持: c/chrome, e/edge[/dim]")
+        return
+
+    config = _load_config()
+    old_browser = config.get("browser", "chrome")
+    config["browser"] = browser
+    _save_config(config)
+
+    if old_browser == browser:
+        console.print(f"[cyan]当前浏览器: {browser}[/cyan]")
+    else:
+        console.print(f"[green]✓ 已切换: {old_browser} → {browser}[/green]")
+
+    # 检查 driver 是否存在
+    drivers_dir = _get_drivers_dir()
+    if browser == "chrome":
+        driver_name = "chromedriver.exe" if platform.system() == "Windows" else "chromedriver"
+    else:
+        driver_name = "msedgedriver.exe" if platform.system() == "Windows" else "msedgedriver"
+
+    driver_path = drivers_dir / driver_name
+    if not driver_path.exists():
+        console.print(f"[yellow]提示: {driver_name} 未安装，请运行 'autohiring scraper download'[/yellow]")
+
+
+@app.command("config")
+def config_browser(
+    path: str = typer.Argument(..., help="浏览器可执行文件路径"),
+    browser: str = typer.Option(None, "-b", "--browser", help="指定浏览器 (c/e)，默认当前"),
+):
+    """设置浏览器路径 (app/exe/二进制文件)"""
+    # 解析浏览器类型
+    if browser:
+        browser = browser.lower()
+        if browser in ("c", "chrome"):
+            browser = "chrome"
+        elif browser in ("e", "edge"):
+            browser = "edge"
+        else:
+            console.print(f"[red]不支持的浏览器: {browser}[/red]")
+            return
+    else:
+        browser = get_current_browser()
+
+    # 验证路径
+    path_obj = Path(path)
+    if not path_obj.exists():
+        console.print(f"[red]路径不存在: {path}[/red]")
+        return
+
+    # 保存配置
+    config = _load_config()
+    config[f"{browser}_path"] = str(path_obj.absolute())
+    _save_config(config)
+
+    console.print(f"[green]✓ 已设置 {browser} 路径: {path}[/green]")
+
+    # 尝试获取版本验证
+    version = _get_browser_version(browser)
+    if version:
+        console.print(f"[cyan]检测到版本: {version}[/cyan]")
+    else:
+        console.print(f"[yellow]警告: 无法获取版本，请确认路径正确[/yellow]")
+
+
+@app.command("status")
+def show_status():
+    """显示当前配置"""
+    config = _load_config()
+    browser = config.get("browser", "chrome")
+    drivers_dir = _get_drivers_dir()
+    system = platform.system()
+
+    console.print(f"[bold]当前浏览器:[/bold] {browser}")
+
+    # 显示自定义路径
+    chrome_path = config.get("chrome_path")
+    edge_path = config.get("edge_path")
+    if chrome_path:
+        console.print(f"[bold]Chrome 路径:[/bold] {chrome_path}")
+    if edge_path:
+        console.print(f"[bold]Edge 路径:[/bold] {edge_path}")
+
+    # 检查 driver 文件
+    chrome_driver = drivers_dir / ("chromedriver.exe" if system == "Windows" else "chromedriver")
+    edge_driver = drivers_dir / ("msedgedriver.exe" if system == "Windows" else "msedgedriver")
+
+    console.print(f"\n[bold]ChromeDriver:[/bold] {'✓ 已安装' if chrome_driver.exists() else '✗ 未安装'}")
+    console.print(f"[bold]EdgeDriver:[/bold]   {'✓ 已安装' if edge_driver.exists() else '✗ 未安装'}")
+
+
+@app.command("download")
+def download_driver(
+    force: bool = typer.Option(False, "--force", "-f", help="强制重新下载"),
+):
+    """下载当前浏览器的 WebDriver"""
+    browser = get_current_browser()
+    browser_name = "Chrome" if browser == "chrome" else "Edge"
+
+    console.print(f"[bold]当前浏览器: {browser_name}[/bold]")
+    console.print(f"[dim]检测 {browser_name} 版本...[/dim]")
+
+    version = _get_browser_version(browser)
+    if not version:
+        console.print(f"[red]未检测到 {browser_name}，请先安装浏览器[/red]")
+        return
+
+    console.print(f"{browser_name} 版本: [cyan]{version}[/cyan]")
+
+    # 获取下载链接
+    result = _get_driver_url(browser, version)
+    if not result:
+        return
+
+    url, driver_version = result
+    driver_name = "ChromeDriver" if browser == "chrome" else "EdgeDriver"
+    console.print(f"匹配的 {driver_name}: [cyan]{driver_version}[/cyan]")
+
+    # 下载
+    drivers_dir = _get_drivers_dir()
+    drivers_dir.mkdir(exist_ok=True)
+
+    _download_driver(browser, url, driver_version, drivers_dir, force)
+
+
+@app.command("update")
+def update_driver():
+    """更新当前浏览器的 WebDriver（强制重新下载）"""
+    download_driver(force=True)
