@@ -23,6 +23,8 @@ console = Console()
 _driver = None
 # 收集的数据
 _collected_data = []
+# 全局反爬虫实例
+_anti_detect = None
 
 # 支持的浏览器类型
 SUPPORTED_BROWSERS = ["chrome", "edge"]
@@ -64,15 +66,38 @@ def get_browser_path(browser: str = None) -> Optional[str]:
     return config.get(f"{browser}_path")
 
 
-def get_driver(headless: bool = False, browser: str = None):
-    """获取 WebDriver（支持 Chrome 和 Edge）"""
+def get_driver(headless: bool = False, browser: str = None, anti_detect_config: Dict[str, Any] = None):
+    """
+    获取 WebDriver（支持 Chrome 和 Edge，带反爬虫检测）
+
+    Args:
+        headless: 是否使用无头模式
+        browser: 浏览器类型 (chrome/edge)
+        anti_detect_config: 反爬虫配置字典，支持的选项：
+            - stealth: bool, 启用隐身模式 (默认 True)
+            - random_ua: bool, 随机 User-Agent (默认 True)
+            - random_window: bool, 随机窗口尺寸 (默认 True)
+            - canvas_protect: bool, Canvas 指纹保护 (默认 True)
+            - webgl_spoof: bool, WebGL 指纹伪装 (默认 True)
+            - audio_protect: bool, 音频指纹保护 (默认 False)
+            - proxy: str, 代理服务器地址
+            - human_delay: bool, 人类行为延迟 (默认 True)
+
+    Returns:
+        Selenium WebDriver 实例
+    """
+    global _anti_detect
     from selenium import webdriver
+    from .anti_detect import AntiDetect
 
     if browser is None:
         browser = get_current_browser()
 
     drivers_dir = Path(__file__).parents[4] / "drivers"
     browser_binary = get_browser_path(browser)
+
+    # 创建反爬虫实例
+    _anti_detect = AntiDetect(anti_detect_config)
 
     if browser == "edge":
         from selenium.webdriver.edge.options import Options
@@ -83,15 +108,16 @@ def get_driver(headless: bool = False, browser: str = None):
             options.binary_location = browser_binary
         if headless:
             options.add_argument("--headless")
-        options.add_argument("--disable-blink-features=AutomationControlled")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
+
+        # 应用反爬虫配置
+        _anti_detect.apply_to_options(options, "edge")
 
         driver_path = drivers_dir / ("msedgedriver.exe" if platform.system() == "Windows" else "msedgedriver")
         if driver_path.exists():
             service = Service(str(driver_path))
-            return webdriver.Edge(service=service, options=options)
-        return webdriver.Edge(options=options)
+            driver = webdriver.Edge(service=service, options=options)
+        else:
+            driver = webdriver.Edge(options=options)
 
     else:  # chrome
         from selenium.webdriver.chrome.options import Options
@@ -101,17 +127,25 @@ def get_driver(headless: bool = False, browser: str = None):
         if browser_binary:
             options.binary_location = browser_binary
         if headless:
-            options.add_argument("--headless")
-        options.add_argument("--disable-blink-features=AutomationControlled")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+            options.add_argument("--headless=new")
+
+        # 应用反爬虫配置
+        _anti_detect.apply_to_options(options, "chrome")
 
         driver_path = drivers_dir / ("chromedriver.exe" if platform.system() == "Windows" else "chromedriver")
         if driver_path.exists():
             service = Service(str(driver_path))
-            return webdriver.Chrome(service=service, options=options)
-        return webdriver.Chrome(options=options)
+            driver = webdriver.Chrome(service=service, options=options)
+        else:
+            driver = webdriver.Chrome(options=options)
+
+    # 注入隐身脚本
+    _anti_detect.inject_stealth_scripts(driver)
+
+    # 随机化窗口
+    _anti_detect.randomize_window(driver)
+
+    return driver
 
 
 def parse_wait_time(value: str) -> float:
@@ -251,7 +285,11 @@ def execute_action(action: str, element=None, value: str = None, field: str = No
     elif action == "input":
         if element and value:
             element.clear()
-            element.send_keys(value)
+            # 使用人类行为模拟输入
+            if _anti_detect and _anti_detect.human_delay:
+                _anti_detect.human_like_typing(element, value)
+            else:
+                element.send_keys(value)
             console.print(f"[green]  ✓ 输入: {value}[/green]")
 
     elif action == "enter":
@@ -421,6 +459,7 @@ def run(
     steps = cfg.get("steps", [])
     wait_login = cfg.get("wait_login", False)
     csv_file = cfg.get("csv")
+    anti_detect_config = cfg.get("anti_detect", {})
 
     if not url:
         console.print("[red]配置缺少 url[/red]")
@@ -445,8 +484,19 @@ def run(
     else:
         console.print()
 
-    # 启动浏览器
-    _driver = get_driver()
+    # 启动浏览器（带反爬虫检测）
+    if anti_detect_config:
+        console.print("[cyan]启用反爬虫检测模式[/cyan]")
+        if anti_detect_config.get("stealth", True):
+            console.print("[dim]  - 隐身模式: 开启[/dim]")
+        if anti_detect_config.get("random_ua", True):
+            console.print("[dim]  - 随机 UA: 开启[/dim]")
+        if anti_detect_config.get("random_window", True):
+            console.print("[dim]  - 随机窗口: 开启[/dim]")
+        if anti_detect_config.get("proxy"):
+            console.print(f"[dim]  - 代理: {anti_detect_config['proxy']}[/dim]")
+
+    _driver = get_driver(anti_detect_config=anti_detect_config)
     _driver.get(url)
     _collected_data = []
 
@@ -589,6 +639,17 @@ wait_login: true  # 等待手动登录
 #   12345,张三
 #   67890,李四
 
+# 反爬虫检测配置（可选）
+anti_detect:
+  stealth: true         # 隐身模式：隐藏 webdriver 属性等 (默认 true)
+  random_ua: true       # 随机 User-Agent (默认 true)
+  random_window: true   # 随机窗口尺寸 (默认 true)
+  canvas_protect: true  # Canvas 指纹保护 (默认 true)
+  webgl_spoof: true     # WebGL 指纹伪装 (默认 true)
+  audio_protect: false  # 音频指纹保护 (默认 false)
+  human_delay: true     # 人类行为延迟 (默认 true)
+  # proxy: "http://user:pass@proxy.example.com:8080"  # 可选代理
+
 steps:
   # 步骤1: 在搜索框输入（使用 ${col_name} 引用 CSV 列）
   - tag: input
@@ -649,6 +710,7 @@ steps:
     console.print(example_yaml)
     console.print("\n[dim]保存为 config.yaml 后运行: autohiring scraper run config.yaml[/dim]")
     console.print("[dim]CSV 循环: 取消 csv 行注释，运行时会为每行数据执行一遍 steps[/dim]")
+    console.print("[dim]反爬虫: anti_detect 配置块可自动绕过常见反爬检测[/dim]")
 
 
 # ============== WebDriver 管理 ==============
