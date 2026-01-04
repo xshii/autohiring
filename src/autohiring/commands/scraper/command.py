@@ -29,6 +29,29 @@ _iframe_stack = []
 # 支持的浏览器类型
 SUPPORTED_BROWSERS = ["chrome", "edge"]
 
+# 常用 User-Agent 列表（用于随机轮换）
+USER_AGENTS = [
+    # Chrome Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
+    # Edge Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36 Edg/119.0.0.0",
+    # Firefox Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
+]
+
+# 隐藏 WebDriver 特征的 JS 脚本
+STEALTH_JS = """
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN', 'zh', 'en']});
+window.chrome = {runtime: {}};
+Object.defineProperty(navigator, 'platform', {get: () => 'Win32'});
+"""
+
 
 def _get_config_path() -> Path:
     """获取配置文件路径"""
@@ -66,15 +89,35 @@ def get_browser_path(browser: str = None) -> Optional[str]:
     return config.get(f"{browser}_path")
 
 
-def get_driver(headless: bool = False, browser: str = None):
-    """获取 WebDriver（支持 Chrome 和 Edge）"""
+def get_driver(headless: bool = False, browser: str = None, stealth: dict = None):
+    """
+    获取 WebDriver（支持 Chrome 和 Edge）
+
+    Args:
+        headless: 无头模式
+        browser: 浏览器类型
+        stealth: 反检测配置
+            - random_ua: 随机 User-Agent
+            - hide_webdriver: 隐藏 WebDriver 特征
+            - disable_images: 禁用图片加载
+            - proxy: 代理服务器地址
+    """
     from selenium import webdriver
 
     if browser is None:
         browser = get_current_browser()
 
+    if stealth is None:
+        stealth = {}
+
     drivers_dir = Path(__file__).parents[4] / "drivers"
     browser_binary = get_browser_path(browser)
+
+    # 解析 stealth 配置
+    random_ua = stealth.get("random_ua", False)
+    hide_webdriver = stealth.get("hide_webdriver", True)  # 默认开启
+    disable_images = stealth.get("disable_images", False)
+    proxy = stealth.get("proxy", "")
 
     if browser == "edge":
         from selenium.webdriver.edge.options import Options
@@ -85,15 +128,41 @@ def get_driver(headless: bool = False, browser: str = None):
             options.binary_location = browser_binary
         if headless:
             options.add_argument("--headless")
-        options.add_argument("--disable-blink-features=AutomationControlled")
+
+        # 基础反检测
+        if hide_webdriver:
+            options.add_argument("--disable-blink-features=AutomationControlled")
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
+
+        # 随机 User-Agent
+        if random_ua:
+            ua = random.choice(USER_AGENTS)
+            options.add_argument(f"--user-agent={ua}")
+            console.print(f"[dim]UA: {ua[:50]}...[/dim]")
+
+        # 禁用图片
+        if disable_images:
+            prefs = {"profile.managed_default_content_settings.images": 2}
+            options.add_experimental_option("prefs", prefs)
+
+        # 代理
+        if proxy:
+            options.add_argument(f"--proxy-server={proxy}")
+            console.print(f"[dim]代理: {proxy}[/dim]")
 
         driver_path = drivers_dir / ("msedgedriver.exe" if platform.system() == "Windows" else "msedgedriver")
         if driver_path.exists():
             service = Service(str(driver_path))
-            return webdriver.Edge(service=service, options=options)
-        return webdriver.Edge(options=options)
+            driver = webdriver.Edge(service=service, options=options)
+        else:
+            driver = webdriver.Edge(options=options)
+
+        # 注入隐藏 WebDriver 的 JS
+        if hide_webdriver:
+            driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": STEALTH_JS})
+
+        return driver
 
     else:  # chrome
         from selenium.webdriver.chrome.options import Options
@@ -104,16 +173,43 @@ def get_driver(headless: bool = False, browser: str = None):
             options.binary_location = browser_binary
         if headless:
             options.add_argument("--headless")
-        options.add_argument("--disable-blink-features=AutomationControlled")
+
+        # 基础反检测
+        if hide_webdriver:
+            options.add_argument("--disable-blink-features=AutomationControlled")
+            options.add_experimental_option("excludeSwitches", ["enable-automation"])
+            options.add_experimental_option("useAutomationExtension", False)
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
-        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+
+        # 随机 User-Agent
+        if random_ua:
+            ua = random.choice(USER_AGENTS)
+            options.add_argument(f"--user-agent={ua}")
+            console.print(f"[dim]UA: {ua[:50]}...[/dim]")
+
+        # 禁用图片
+        if disable_images:
+            prefs = {"profile.managed_default_content_settings.images": 2}
+            options.add_experimental_option("prefs", prefs)
+
+        # 代理
+        if proxy:
+            options.add_argument(f"--proxy-server={proxy}")
+            console.print(f"[dim]代理: {proxy}[/dim]")
 
         driver_path = drivers_dir / ("chromedriver.exe" if platform.system() == "Windows" else "chromedriver")
         if driver_path.exists():
             service = Service(str(driver_path))
-            return webdriver.Chrome(service=service, options=options)
-        return webdriver.Chrome(options=options)
+            driver = webdriver.Chrome(service=service, options=options)
+        else:
+            driver = webdriver.Chrome(options=options)
+
+        # 注入隐藏 WebDriver 的 JS
+        if hide_webdriver:
+            driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": STEALTH_JS})
+
+        return driver
 
 
 def parse_wait_time(value: str) -> float:
@@ -566,6 +662,7 @@ def run(
     steps = cfg.get("steps", [])
     wait_login = cfg.get("wait_login", False)
     csv_file = cfg.get("csv")
+    stealth = cfg.get("stealth", {})
 
     if not url:
         console.print("[red]配置缺少 url[/red]")
@@ -585,13 +682,15 @@ def run(
     console.print(f"[bold]执行配置: {config}[/bold]")
     console.print(f"URL: {url}")
     console.print(f"步骤数: {len(steps)}")
+    if stealth:
+        console.print(f"反检测: {stealth}")
     if csv_rows:
         console.print(f"CSV 循环: {len(csv_rows)} 次\n")
     else:
         console.print()
 
-    # 启动浏览器
-    _driver = get_driver()
+    # 启动浏览器（传入 stealth 配置）
+    _driver = get_driver(stealth=stealth)
     _driver.get(url)
     _collected_data = []
 
@@ -727,6 +826,13 @@ def example():
 url: "https://example.com"
 wait_login: true  # 等待手动登录
 
+# ========== 反检测配置 ==========
+stealth:
+  random_ua: true        # 随机 User-Agent
+  hide_webdriver: true   # 隐藏 WebDriver 特征（默认开启）
+  disable_images: false  # 禁用图片加载（加速）
+  proxy: ""              # 代理服务器，如 "http://127.0.0.1:7890"
+
 # CSV 循环（可选）：从 CSV 读取数据，对每行执行 steps
 # csv: "data.csv"
 # CSV 文件格式：
@@ -790,10 +896,37 @@ steps:
       - tag: a
         text: "返回"
         action: click
+
+  # ========== 其他常用动作 ==========
+  # 鼠标悬停（触发弹窗）
+  # - tag: div
+  #   class: "trigger"
+  #   action: hover
+
+  # 获取链接地址
+  # - tag: a
+  #   action: attr
+  #   value: "href"
+  #   field: "链接"
+
+  # 下拉框选择
+  # - tag: select
+  #   id: "city"
+  #   action: select
+  #   value: "北京"
+
+  # 滚动页面
+  # - action: scroll
+  #   value: "bottom"   # top/bottom/500
+
+  # 退出 iframe 回主页面
+  # - action: switch_out
 '''
     console.print(example_yaml)
     console.print("\n[dim]保存为 config.yaml 后运行: autohiring scraper run config.yaml[/dim]")
     console.print("[dim]CSV 循环: 取消 csv 行注释，运行时会为每行数据执行一遍 steps[/dim]")
+    console.print("[dim]反检测: stealth 块配置防爬措施，hide_webdriver 默认开启[/dim]")
+    console.print("[dim]自动 iframe: 找不到元素时会自动遍历 iframe 查找[/dim]")
 
 
 # ============== WebDriver 管理 ==============
