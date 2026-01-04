@@ -23,6 +23,8 @@ console = Console()
 _driver = None
 # 收集的数据
 _collected_data = []
+# 当前 iframe 层级（用于自动切换回来）
+_iframe_stack = []
 
 # 支持的浏览器类型
 SUPPORTED_BROWSERS = ["chrome", "edge"]
@@ -215,8 +217,15 @@ def build_xpath(rule: Dict[str, Any]) -> str:
     return f"//{tag}"
 
 
-def find_elements(xpath: str, context=None) -> list:
-    """在上下文中查找元素"""
+def find_elements(xpath: str, context=None, auto_switch_frame: bool = True) -> list:
+    """
+    在上下文中查找元素
+
+    Args:
+        xpath: XPath 选择器
+        context: 上下文元素
+        auto_switch_frame: 找不到时是否自动遍历 iframe 查找
+    """
     from selenium.webdriver.common.by import By
 
     try:
@@ -224,9 +233,79 @@ def find_elements(xpath: str, context=None) -> list:
             if xpath.startswith("//"):
                 xpath = "." + xpath
             return context.find_elements(By.XPATH, xpath)
-        return _driver.find_elements(By.XPATH, xpath)
+
+        elements = _driver.find_elements(By.XPATH, xpath)
+
+        # 如果没找到且开启自动切换，尝试遍历 iframe
+        if not elements and auto_switch_frame:
+            elements = _find_in_iframes(xpath)
+
+        return elements
     except Exception:
         return []
+
+
+def _find_in_iframes(xpath: str) -> list:
+    """
+    递归遍历所有 iframe 查找元素
+    找到后自动切换到对应的 iframe
+    """
+    from selenium.webdriver.common.by import By
+    global _iframe_stack
+
+    # 获取当前页面的所有 iframe
+    try:
+        iframes = _driver.find_elements(By.TAG_NAME, "iframe")
+        iframes += _driver.find_elements(By.TAG_NAME, "frame")
+    except Exception:
+        return []
+
+    for i, iframe in enumerate(iframes):
+        try:
+            # 切换到 iframe
+            _driver.switch_to.frame(iframe)
+            _iframe_stack.append(i)
+            console.print(f"[dim]  → 进入 iframe[{i}][/dim]")
+
+            # 在 iframe 中查找
+            elements = _driver.find_elements(By.XPATH, xpath)
+            if elements:
+                console.print(f"[green]  ✓ 在 iframe 中找到 {len(elements)} 个元素[/green]")
+                return elements
+
+            # 递归查找嵌套的 iframe
+            nested_elements = _find_in_iframes(xpath)
+            if nested_elements:
+                return nested_elements
+
+            # 没找到，切换回上一层
+            _driver.switch_to.parent_frame()
+            _iframe_stack.pop()
+            console.print(f"[dim]  ← 退出 iframe[{i}][/dim]")
+
+        except Exception as e:
+            # 切换失败，跳过这个 iframe
+            if _iframe_stack:
+                _iframe_stack.pop()
+            try:
+                _driver.switch_to.parent_frame()
+            except Exception:
+                pass
+
+    return []
+
+
+def switch_to_main_frame():
+    """切换回主页面（退出所有 iframe）"""
+    global _iframe_stack
+
+    if _iframe_stack:
+        _driver.switch_to.default_content()
+        depth = len(_iframe_stack)
+        _iframe_stack.clear()
+        console.print(f"[dim]  ← 退出 {depth} 层 iframe，回到主页面[/dim]")
+
+    return True
 
 
 def execute_action(action: str, element=None, value: str = None, field: str = None):
@@ -234,10 +313,25 @@ def execute_action(action: str, element=None, value: str = None, field: str = No
     执行动作
 
     Args:
-        action: 动作类型 (click, input, enter, extract, save, print, wait, sleep)
+        action: 动作类型
         element: 目标元素
-        value: 动作值（input 的文字、wait 的秒数等）
-        field: 字段名（save 动作用于指定保存的字段名）
+        value: 动作值
+        field: 字段名
+
+    支持的动作:
+        click      - 点击元素
+        input      - 输入文字 (value: 文字内容)
+        enter      - 按回车键
+        extract    - 提取文本
+        save       - 保存到结果 (field: 字段名)
+        print      - 打印到控制台
+        wait       - 等待页面就绪 + 额外时间 (value: "2" 或 "3,10")
+        sleep      - 纯等待 (value: 秒数)
+        hover      - 鼠标悬停
+        switch_out - 切换回主页面（退出所有 iframe）
+        attr       - 获取元素属性 (value: 属性名, field: 保存字段名)
+        select     - 下拉框选择 (value: 选项文本/值/索引)
+        scroll     - 滚动 (value: "top"/"bottom"/像素数, 或元素滚动到视图)
     """
     from selenium.webdriver.common.keys import Keys
 
@@ -300,6 +394,57 @@ def execute_action(action: str, element=None, value: str = None, field: str = No
         seconds = parse_wait_time(value) if value else 1
         time.sleep(seconds)
         console.print(f"[dim]  等待 {seconds:.1f}s[/dim]")
+
+    elif action == "hover":
+        # 鼠标悬停（触发弹窗/菜单）
+        if element:
+            from selenium.webdriver.common.action_chains import ActionChains
+            ActionChains(_driver).move_to_element(element).perform()
+            console.print("[green]  ✓ 悬停[/green]")
+            time.sleep(0.3)  # 等待弹窗出现
+
+    elif action == "switch_out":
+        # 切换回主页面（退出所有 iframe）
+        switch_to_main_frame()
+
+    elif action == "attr":
+        # 获取元素属性
+        if element:
+            attr_name = value or "href"
+            attr_value = element.get_attribute(attr_name)
+            console.print(f"[cyan]  属性 {attr_name}: {attr_value}[/cyan]")
+            if field:
+                return {field: attr_value}
+            return {"attr": attr_value}
+
+    elif action == "select":
+        # 下拉框选择
+        if element and value:
+            from selenium.webdriver.support.ui import Select
+            sel = Select(element)
+            # 尝试按文本选择，失败则按值选择
+            try:
+                sel.select_by_visible_text(value)
+            except Exception:
+                try:
+                    sel.select_by_value(value)
+                except Exception:
+                    sel.select_by_index(int(value))
+            console.print(f"[green]  ✓ 选择: {value}[/green]")
+
+    elif action == "scroll":
+        # 滚动页面
+        if value:
+            if value.lower() == "bottom":
+                _driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            elif value.lower() == "top":
+                _driver.execute_script("window.scrollTo(0, 0);")
+            else:
+                _driver.execute_script(f"window.scrollBy(0, {value});")
+            console.print(f"[green]  ✓ 滚动: {value}[/green]")
+        elif element:
+            _driver.execute_script("arguments[0].scrollIntoView(true);", element)
+            console.print("[green]  ✓ 滚动到元素[/green]")
 
     return None
 
