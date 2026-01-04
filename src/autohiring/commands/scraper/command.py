@@ -428,6 +428,14 @@ def execute_action(action: str, element=None, value: str = None, field: str = No
         attr       - 获取元素属性 (value: 属性名, field: 保存字段名)
         select     - 下拉框选择 (value: 选项文本/值/索引)
         scroll     - 滚动 (value: "top"/"bottom"/像素数, 或元素滚动到视图)
+
+        # 页面/窗口跳转
+        goto          - 跳转到 URL (value: URL)
+        back          - 浏览器后退
+        forward       - 浏览器前进
+        refresh       - 刷新页面
+        switch_window - 切换窗口 (value: "new"/"main"/"close"/索引)
+        new_tab       - 打开新标签页 (value: URL)
     """
     from selenium.webdriver.common.keys import Keys
 
@@ -541,6 +549,76 @@ def execute_action(action: str, element=None, value: str = None, field: str = No
         elif element:
             _driver.execute_script("arguments[0].scrollIntoView(true);", element)
             console.print("[green]  ✓ 滚动到元素[/green]")
+
+    # ========== 页面/窗口跳转 ==========
+    elif action == "goto":
+        # 跳转到指定 URL
+        if value:
+            _driver.get(value)
+            console.print(f"[green]  ✓ 跳转: {value}[/green]")
+
+    elif action == "back":
+        # 浏览器后退
+        _driver.back()
+        console.print("[green]  ✓ 后退[/green]")
+
+    elif action == "forward":
+        # 浏览器前进
+        _driver.forward()
+        console.print("[green]  ✓ 前进[/green]")
+
+    elif action == "refresh":
+        # 刷新页面
+        _driver.refresh()
+        console.print("[green]  ✓ 刷新[/green]")
+
+    elif action == "switch_window":
+        # 切换窗口/标签页
+        # value: "new" 切换到最新窗口, "0"/"1"/... 切换到指定索引, "close" 关闭当前窗口
+        handles = _driver.window_handles
+        current = _driver.current_window_handle
+
+        if value == "new" or value == "-1":
+            # 切换到最新打开的窗口
+            if len(handles) > 1:
+                _driver.switch_to.window(handles[-1])
+                console.print(f"[green]  ✓ 切换到新窗口 (共 {len(handles)} 个)[/green]")
+            else:
+                console.print("[yellow]  没有新窗口[/yellow]")
+
+        elif value == "close":
+            # 关闭当前窗口，切换回上一个
+            if len(handles) > 1:
+                _driver.close()
+                _driver.switch_to.window(handles[0])
+                console.print(f"[green]  ✓ 关闭窗口，切换回主窗口[/green]")
+            else:
+                console.print("[yellow]  只有一个窗口，无法关闭[/yellow]")
+
+        elif value == "main" or value == "0":
+            # 切换回主窗口（第一个）
+            _driver.switch_to.window(handles[0])
+            console.print("[green]  ✓ 切换回主窗口[/green]")
+
+        elif value and value.isdigit():
+            # 切换到指定索引的窗口
+            idx = int(value)
+            if 0 <= idx < len(handles):
+                _driver.switch_to.window(handles[idx])
+                console.print(f"[green]  ✓ 切换到窗口 {idx}[/green]")
+            else:
+                console.print(f"[red]  窗口索引无效: {idx} (共 {len(handles)} 个)[/red]")
+
+        else:
+            # 显示当前窗口信息
+            console.print(f"[cyan]  当前窗口: {handles.index(current)}/{len(handles)}[/cyan]")
+
+    elif action == "new_tab":
+        # 打开新标签页
+        url = value or "about:blank"
+        _driver.execute_script(f"window.open('{url}', '_blank');")
+        _driver.switch_to.window(_driver.window_handles[-1])
+        console.print(f"[green]  ✓ 新标签页: {url}[/green]")
 
     return None
 
